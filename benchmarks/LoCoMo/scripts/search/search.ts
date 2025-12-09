@@ -72,7 +72,7 @@ const searchQuestion = async (question: string): Promise<any> => {
         body: JSON.stringify({
             q: question,
             containerTag: containerTag,
-            limit: 20,
+            limit: 10,
             threshold: 0.3,
             include: { chunks: true }
         }),

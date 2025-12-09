@@ -112,7 +112,7 @@ const ingestSession = async (
             },
             body: JSON.stringify({
                 content,
-                containerTags: [containerTag],
+                containerTag: containerTag,
             }),
         });
 

@@ -114,41 +114,146 @@ const searchQuestion = async (question: string): Promise<any> => {
     return response.json();
 };
 
+// Helper to deduplicate and sort chunks
+interface Chunk {
+    content: string;
+    position: number;
+    [key: string]: any;
+}
+
+function deduplicateAndSortChunks(chunks: Chunk[]): Chunk[] {
+    const uniqueChunks = chunks.filter((chunk, index, self) =>
+        index === self.findIndex((c) => c.content === chunk.content)
+    );
+    return uniqueChunks.sort((a, b) => a.position - b.position);
+}
+
 // Generate answer using LLM
 const generateAnswer = async (question: string, searchResults: any, questionDate?: string): Promise<string> => {
     const allResults = searchResults.results || [];
     
+    // Build memories section with temporal context
+    const memoriesSection = allResults
+        .map((result: any, i: number) => {
+            const memory = result.memory || '';
+            const temporalContext = result.metadata?.temporalContext || result.temporalContext;
+            const documentDate = temporalContext?.documentDate;
+            const eventDate = temporalContext?.eventDate;
+            
+            let memoryParts = [`Result ${i + 1}:`, memory];
+            
+            if (documentDate || eventDate) {
+                const temporalInfo: string[] = [];
+                if (documentDate) temporalInfo.push(`documentDate: ${documentDate}`);
+                if (eventDate) {
+                    const eventDates = Array.isArray(eventDate) ? eventDate : [eventDate];
+                    temporalInfo.push(`eventDate: ${eventDates.join(', ')}`);
+                }
+                memoryParts.push(`Temporal Context: ${temporalInfo.join(' | ')}`);
+            }
+            
+            return memoryParts.join('\n');
+        })
+        .join('\n\n---\n\n');
+    
+    // Extract and deduplicate chunks from all results
+    const allChunks: Chunk[] = [];
+    for (const result of allResults) {
+        const chunks = result.chunks || [];
+        for (const chunk of chunks) {
+            allChunks.push({
+                content: chunk.content || chunk.text || '',
+                position: chunk.position ?? 0,
+                ...chunk
+            });
+        }
+    }
+    const deduplicatedChunks = deduplicateAndSortChunks(allChunks);
+    
+    // Build chunks section
+    const chunksSection = deduplicatedChunks.length > 0
+        ? `\n\n=== DEDUPLICATED CHUNKS ===\n${deduplicatedChunks.map(chunk => chunk.content).join('\n\n---\n\n')}`
+        : '';
+    
+    // Combine into retrieved context
+    const retrievedContext = memoriesSection + chunksSection;
+
     if (allResults.length === 0) {
-        return "I don't have enough information to answer this question.";
+        return "I don't have enough information in my memory to answer this question.";
     }
 
-    // Build context from results
-    const context = allResults.map((result: any, i: number) => {
-        const memory = result.memory || '';
-        const chunks = result.chunks || [];
-        const chunkText = chunks.map((c: any) => c.content || c.text || '').join('\n');
-        return `Result ${i + 1}:\nMemory: ${memory}\nContent:\n${chunkText}`;
-    }).join('\n\n---\n\n');
-
     try {
-        const { text } = await generateText({
+        const { text: llmResponse } = await generateText({
             model: GENERATOR_MODEL,
-            prompt: `You are a question-answering system. Answer based on the context below.
+            prompt: `You are a question-answering system. Based on the retrieved context below, answer the question.
 
 Question: ${question}
-Question Date: ${questionDate || 'Not provided'}
 
-Context:
-${context}
+Retrieved Context:
+${retrievedContext}
+
+**Understanding the Context:**
+The context contains search results from a memory system. Each result has multiple components you can use:
+
+1. **Memory**: A high-level summary/atomic fact (e.g., "Alex loves hiking in mountains", "John reports to Maria")
+   - This is the searchable title/summary of what was stored
+
+2. **Chunks**: The actual detailed raw content where the memory was extracted from
+   - Contains conversations, documents, messages, or text excerpts
+   - **This is your primary source for detailed information and facts**
+   - Look here for specifics, context, quotes, and evidence
+
+3. **Temporal Context** (if present):
+   - **Question Date**: The date when the question was asked (provided above). Use this to understand the temporal perspective of the question.
+   - **documentDate**: ISO date string for when the content was originally authored/written/said by the user (NOT the system createdAt timestamp). This is the reference point for calculating relative dates. Extract from document metadata, timestamps, or context.
+   - **eventDate**: Array of ISO date strings for when the event/fact being referenced actually occurred or will occur. Always provided as an array, even for single dates. For past events use past dates, for future events use future dates. Calculate relative dates (today, yesterday, last week) based on documentDate, NOT the current date.
+   - Useful for time-based questions (what happened when, recent vs old info)
+   - **Important**: When you see relative terms like "today", "yesterday", calculate them relative to the documentDate, NOT the current date. The question date helps you understand the temporal context of what the user is asking about.
+
+4. **Profile Data** (if present):
+   - **Static Profile**: Permanent user characteristics (name, preferences, core identity)
+   - **Dynamic Profile**: Contains a subset of the recently added memories
+   - Provides background about the user
+
+5. **Version**: Shows if a memory has been updated/extended over time
+
+**How to Answer:**
+1. Start by scanning memory titles to find relevant results
+2. **Read the chunks carefully** - they contain the actual details you need
+3. Use temporal context to understand when things happened
+4. Use profile data for background about the user
+5. Synthesize information from multiple results if needed
+
+# INSTRUCTIONS (LoCoMo Specific):
+
+1. **Conciseness**: Keep answers concise (typically under 20 words), but ensure completeness.
+2. **Timestamp Logic**:
+   - If the question asks about a specific event or fact, look for evidence in the memories or chunks.
+   - If the content contains contradictory information, prioritize the most recent information.
+   - If there is a question about time references (like "last year", "two months ago", etc.), calculate the actual date based on the memory/chunk timestamp.
+   - Always convert relative time references to specific dates, months, or years.
+3. **Focus**: Focus only on the content of the memories. Do not confuse character names mentioned in memories with the actual users who created those memories.
+
+# APPROACH (Think step by step):
+
+1. First, examine all memories that contain information related to the question.
+2. Examine the timestamps and content of these memories carefully.
+3. Look for mentions of dates, times, locations, or events that answer the question.
+4. If the answer requires calculation (e.g., converting relative time references), show your work.
+5. Formulate a precise, concise answer based on the evidence in the memories.
+6. Double-check that your answer directly addresses the question asked.
+7. Ensure your final answer is specific and avoids vague time references.
 
 Instructions:
-- Answer concisely (10-15 words max)
-- Base your answer ONLY on the provided context
-- If you can't find the answer, say "I don't know"
+- If the context contains enough information to answer the question, provide a clear, concise answer
+- If the context does not contain enough information, respond with "I don't know" or explain what information is missing
+- Base your answer on the provided context. You may make reasonable inferences from what's stated, but do not introduce facts not grounded in the context.
+- **Prioritize information from chunks** - they're the raw source material
 
 Answer:`,
         });
-        return text;
+
+        return llmResponse;
     } catch (error) {
         console.error('Error generating answer:', error);
         return "Error generating answer";
@@ -158,35 +263,99 @@ Answer:`,
 // Judge answer
 const evaluateAnswer = async (
     question: string,
-    groundTruth: string,
-    generated: string
-): Promise<{ score: number; label: string }> => {
+    groundTruthAnswer: string,
+    generatedAnswer: string
+): Promise<{ score: number; label: string; reasoning: string }> => {
     try {
-        const { text } = await generateText({
+        const { text: judgement } = await generateText({
             model: JUDGE_MODEL,
-            prompt: `Judge if the response is correct.
+            prompt: `Your task is to label an answer to a question as "CORRECT" or "WRONG". You will be given
+
+the following data: (1) a question (posed by one user to another user), (2) a 'gold'
+
+(ground truth) answer, (3) a generated answer which you will score as CORRECT/WRONG.
+
+The point of the question is to ask about something one user should know about the other
+
+user based on their prior conversations. The gold answer will usually be a concise and
+
+short answer that includes the referenced topic, for example:
+
+Question: Do you remember what I got the last time I went to Hawaii?
+
+Gold answer: A shell necklace
+
+The generated answer might be much longer, but you should be generous with your grading
+
+- as long as it touches on the same topic as the gold answer, it should be counted as
+
+CORRECT.
+
+For time related questions, the gold answer will be a specific date, month, year, etc. The
+
+generated answer might be much longer or use relative time references (like 'last Tuesday'
+
+or 'next month'), but you should be generous with your grading - as long as it refers to
+
+the same date or time period as the gold answer, it should be counted as CORRECT. Even if
+
+the format differs (e.g., 'May 7th' vs '7 May'), consider it CORRECT if it's the same date.
+
+Now it's time for the real question:
 
 Question: ${question}
-Correct Answer: ${groundTruth}
-Response: ${generated}
 
-Be generous - if the response captures the same meaning as the correct answer, it's CORRECT.
+Gold answer: ${groundTruthAnswer}
 
-Return JSON: {"label": "CORRECT" or "WRONG"}`,
+Generated answer: ${generatedAnswer}
+
+Return a JSON object with:
+- "label": "CORRECT" or "WRONG"
+- "reasoning": A short (one sentence) explanation of your reasoning
+
+Example: {"label": "CORRECT", "reasoning": "The generated answer mentions the same topic as the gold answer."}`,
         });
 
-        const match = text.match(/\{[\s\S]*\}/);
-        if (match) {
-            const parsed = JSON.parse(match[0]);
-            return {
-                score: parsed.label === "CORRECT" ? 1 : 0,
-                label: parsed.label
-            };
+        // Parse JSON response
+        let score = 0;
+        let label = "WRONG";
+        let reasoning = "";
+        
+        try {
+            // Extract JSON block if present (in case LLM wraps it in markdown)
+            const jsonMatch = judgement.match(/\{[\s\S]*\}/);
+            const jsonStr = jsonMatch ? jsonMatch[0] : judgement;
+            const parsed = JSON.parse(jsonStr);
+            
+            // Handle format: "CORRECT" or "WRONG"
+            if (parsed.label === "CORRECT") {
+                score = 1;
+                label = "CORRECT";
+            } else if (parsed.label === "WRONG") {
+                score = 0;
+                label = "WRONG";
+            } else if (parsed.label === 1) {
+                score = 1;
+                label = "CORRECT";
+            }
+            
+            reasoning = parsed.reasoning || "";
+        } catch (e) {
+            // Fallback if JSON parsing fails: look for "CORRECT" or "WRONG" in text
+            if (judgement.includes('"label": "CORRECT"') || judgement.includes('"label":"CORRECT"')) {
+                score = 1;
+                label = "CORRECT";
+            } else if (judgement.includes('CORRECT') && !judgement.includes('WRONG')) {
+                score = 1;
+                label = "CORRECT";
+            }
+            reasoning = judgement; // Use full response as reasoning
         }
-        return { score: 0, label: "WRONG" };
+        
+        return { score, label, reasoning };
     } catch (error) {
-        console.error('Error judging:', error);
-        return { score: 0, label: "WRONG" };
+        console.error('Error judging answer:', error);
+        return { score: 0, label: "WRONG", reasoning: `Error: ${error}` };
     }
 };
 
@@ -234,6 +403,7 @@ const runEvaluation = async () => {
                 generated_answer: generatedAnswer,
                 score: judgement.score,
                 judge_label: judgement.label,
+                judge_reasoning: judgement.reasoning,
                 search_results: searchResults,
                 timestamp: new Date().toISOString(),
             });
@@ -262,6 +432,7 @@ const runEvaluation = async () => {
                 generated_answer: "Error",
                 score: 0,
                 judge_label: "ERROR",
+                judge_reasoning: `Error: ${error instanceof Error ? error.message : String(error)}`,
                 error: error instanceof Error ? error.message : String(error),
                 timestamp: new Date().toISOString(),
             });
