@@ -4,21 +4,21 @@ import { AnthropicJudge } from "./anthropic"
 import { GoogleJudge } from "./google"
 
 const judges: Record<JudgeName, new () => Judge> = {
-    openai: OpenAIJudge,
-    anthropic: AnthropicJudge,
-    google: GoogleJudge,
+  openai: OpenAIJudge,
+  anthropic: AnthropicJudge,
+  google: GoogleJudge,
 }
 
 export function createJudge(name: JudgeName): Judge {
-    const JudgeClass = judges[name]
-    if (!JudgeClass) {
-        throw new Error(`Unknown judge: ${name}. Available: ${Object.keys(judges).join(", ")}`)
-    }
-    return new JudgeClass()
+  const JudgeClass = judges[name]
+  if (!JudgeClass) {
+    throw new Error(`Unknown judge: ${name}. Available: ${Object.keys(judges).join(", ")}`)
+  }
+  return new JudgeClass()
 }
 
 export function getAvailableJudges(): JudgeName[] {
-    return Object.keys(judges) as JudgeName[]
+  return Object.keys(judges) as JudgeName[]
 }
 
 export { OpenAIJudge, AnthropicJudge, GoogleJudge }
