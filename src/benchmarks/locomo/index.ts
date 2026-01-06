@@ -14,10 +14,11 @@ const DEFAULT_DATA_PATH = "./data/benchmarks/locomo/locomo10.json"
 const GITHUB_DATASET_URL =
   "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 
-function parseLocomoDate(dateStr: string): { iso: string; formatted: string } {
+function parseLocomoDate(dateStr: string): { iso: string; formatted: string } | null {
   const match = dateStr.match(/(\d+):(\d+)\s*(am|pm)\s*on\s*(\d+)\s*(\w+),?\s*(\d+)/i)
   if (!match) {
-    return { iso: new Date().toISOString(), formatted: dateStr }
+    logger.warn(`Failed to parse LoCoMo date: "${dateStr}" - skipping date metadata`)
+    return null
   }
   const [, hourStr, min, ampm, day, monthName, year] = match
   let hour = parseInt(hourStr)

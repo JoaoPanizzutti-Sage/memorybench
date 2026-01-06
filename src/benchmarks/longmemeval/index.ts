@@ -14,10 +14,11 @@ const DEFAULT_DATA_PATH = "./data/benchmarks/longmemeval/datasets"
 const HF_DATASET_URL =
   "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json"
 
-function parseLongMemEvalDate(dateStr: string): { iso: string; formatted: string } {
+function parseLongMemEvalDate(dateStr: string): { iso: string; formatted: string } | null {
   const match = dateStr.match(/(\d{4})\/(\d{2})\/(\d{2})\s*\([^)]*\)\s*(\d{2}):(\d{2})/)
   if (!match) {
-    return { iso: new Date().toISOString(), formatted: dateStr }
+    logger.warn(`Failed to parse LongMemEval date: "${dateStr}" - skipping date metadata`)
+    return null
   }
   const [, year, month, day, hour, min] = match
   const date = new Date(
