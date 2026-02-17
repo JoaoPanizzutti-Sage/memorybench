@@ -26,6 +26,10 @@ export function getProviderConfig(provider: string): { apiKey: string; baseUrl?:
       return { apiKey: config.mem0ApiKey }
     case "zep":
       return { apiKey: config.zepApiKey }
+    case "filesystem":
+      return { apiKey: config.openaiApiKey } // Filesystem uses OpenAI for memory extraction
+    case "rag":
+      return { apiKey: config.openaiApiKey } // RAG provider uses OpenAI for embeddings
     default:
       throw new Error(`Unknown provider: ${provider}`)
   }

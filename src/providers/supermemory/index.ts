@@ -123,9 +123,13 @@ export class SupermemoryProvider implements Provider {
     const response = await this.client.search.memories({
       q: query,
       containerTag: options.containerTag,
-      limit: options.limit || 10,
+      limit: 30,
       threshold: options.threshold || 0.3,
-      searchMode: "hybrid",
+			searchMode: "hybrid",
+			include: {
+				summaries: true,
+				chunks: true
+      }
     })
 
     return response.results || []
