@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs"
+import { readFile, writeFile, mkdir } from "fs/promises"
 import { embedMany, embed } from "ai"
 import { createOpenAI } from "@ai-sdk/openai"
 import type {
@@ -12,12 +12,13 @@ import type {
 import type { UnifiedSession } from "../../types/unified"
 import { logger } from "../../utils/logger"
 import { HybridSearchEngine } from "./search"
-import type { Chunk } from "./search"
+import type { Chunk, SearchResult } from "./search"
 import { RAG_PROMPTS } from "./prompts"
 import { extractMemories, parseExtractionOutput } from "../../prompts/extraction"
 import { rerankResults } from "./reranker"
 import { EntityGraph } from "./graph"
-import type { SerializedGraph } from "./graph"
+import type { SerializedGraph, GraphSearchResult } from "./graph"
+import { ContainerLock } from "./lock"
 
 const CHUNK_SIZE = 1600
 const CHUNK_OVERLAP = 320
@@ -81,6 +82,8 @@ export class RAGProvider implements Provider {
   private extractionInFlight = new Map<string, Promise<string>>()
   private activeGlobalExtractions = 0
   private extractionQueue: Array<() => void> = []
+  private containerLock = new ContainerLock()
+  private cacheLoading = new Map<string, Promise<boolean>>()
 
   private async acquireExtractionSlot(): Promise<void> {
     if (this.activeGlobalExtractions < MAX_GLOBAL_EXTRACTIONS) {
@@ -112,43 +115,83 @@ export class RAGProvider implements Provider {
     return `${CACHE_DIR}/${containerTag}`
   }
 
-  private saveToCache(containerTag: string): void {
+  private async saveToCache(containerTag: string): Promise<void> {
     const dir = this.getCacheDir(containerTag)
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    await mkdir(dir, { recursive: true })
 
-    const searchData = this.searchEngine.save(containerTag)
-    if (searchData) {
-      writeFileSync(`${dir}/search.json`, JSON.stringify(searchData))
-      logger.info(`[cache] Saved search index for ${containerTag} (${searchData.chunks.length} chunks)`)
+    await this.containerLock.readLock(containerTag)
+    let searchJson: string | null = null
+    let graphJson: string | null = null
+    let searchCount = 0
+    let graphNodeCount = 0
+    let graphEdgeCount = 0
+    try {
+      const searchData = this.searchEngine.save(containerTag)
+      if (searchData) {
+        searchJson = JSON.stringify(searchData)
+        searchCount = searchData.chunks.length
+      }
+      const graph = this.graphs.get(containerTag)
+      if (graph && graph.nodeCount > 0) {
+        const graphData = graph.save()
+        graphJson = JSON.stringify(graphData)
+        graphNodeCount = graphData.nodes.length
+        graphEdgeCount = graphData.edges.length
+      }
+    } finally {
+      this.containerLock.readUnlock(containerTag)
     }
 
-    const graph = this.graphs.get(containerTag)
-    if (graph && graph.nodeCount > 0) {
-      const graphData = graph.save()
-      writeFileSync(`${dir}/graph.json`, JSON.stringify(graphData))
-      logger.info(`[cache] Saved entity graph for ${containerTag} (${graphData.nodes.length} nodes, ${graphData.edges.length} edges)`)
+    if (searchJson) {
+      await writeFile(`${dir}/search.json`, searchJson)
+      logger.info(`[cache] Saved search index for ${containerTag} (${searchCount} chunks)`)
+    }
+    if (graphJson) {
+      await writeFile(`${dir}/graph.json`, graphJson)
+      logger.info(`[cache] Saved entity graph for ${containerTag} (${graphNodeCount} nodes, ${graphEdgeCount} edges)`)
     }
   }
 
-  private loadFromCache(containerTag: string): boolean {
+  private loadFromCache(containerTag: string): Promise<boolean> {
+    const existing = this.cacheLoading.get(containerTag)
+    if (existing) return existing
+
+    const promise = this.doLoadFromCache(containerTag).finally(() => {
+      this.cacheLoading.delete(containerTag)
+    })
+    this.cacheLoading.set(containerTag, promise)
+    return promise
+  }
+
+  private async doLoadFromCache(containerTag: string): Promise<boolean> {
     const dir = this.getCacheDir(containerTag)
     const searchPath = `${dir}/search.json`
-    if (!existsSync(searchPath)) return false
 
     try {
-      const searchData = JSON.parse(readFileSync(searchPath, "utf8"))
-      this.searchEngine.load(containerTag, searchData)
+      const raw = await readFile(searchPath, "utf8")
+      const searchData = JSON.parse(raw)
 
+      let graphData: SerializedGraph | null = null
       const graphPath = `${dir}/graph.json`
-      if (existsSync(graphPath)) {
-        const graphData = JSON.parse(readFileSync(graphPath, "utf8")) as SerializedGraph
-        const graph = this.getGraph(containerTag)
-        graph.load(graphData)
+      try {
+        graphData = JSON.parse(await readFile(graphPath, "utf8")) as SerializedGraph
+      } catch {}
+
+      await this.containerLock.writeLock(containerTag)
+      try {
+        this.searchEngine.load(containerTag, searchData)
+        if (graphData) {
+          const graph = this.getGraph(containerTag)
+          graph.load(graphData)
+        }
+      } finally {
+        this.containerLock.writeUnlock(containerTag)
       }
 
       logger.info(`[cache] Loaded index for ${containerTag} (${this.searchEngine.getChunkCount(containerTag)} chunks)`)
       return true
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.code === "ENOENT") return false
       logger.warn(`[cache] Failed to load cache for ${containerTag}: ${e}`)
       return false
     }
@@ -235,50 +278,51 @@ export class RAGProvider implements Provider {
     let totalEntities = 0
     let totalRelationships = 0
 
-    for (let si = 0; si < sessions.length; si++) {
-      const session = sessions[si]
+    const parsedSessions = sessions.map((session, si) => {
       const rawExtraction = extractions[si]
-
       const isoDate = (session.metadata?.date as string) || "unknown"
       const dateStr = isoDate !== "unknown" ? isoDate.split("T")[0] : "unknown"
-
-      // Parse structured extraction output
       const parsed = parseExtractionOutput(rawExtraction)
+      return { session, parsed, dateStr }
+    })
 
-      // Build entity graph
-      for (const entity of parsed.entities) {
-        graph.addEntity(entity.name, entity.type, entity.summary, session.sessionId)
+    await this.containerLock.writeLock(options.containerTag)
+    try {
+      for (const { session, parsed, dateStr } of parsedSessions) {
+        for (const entity of parsed.entities) {
+          graph.addEntity(entity.name, entity.type, entity.summary, session.sessionId)
+        }
+        for (const rel of parsed.relationships) {
+          graph.addRelationship({
+            source: rel.source,
+            target: rel.target,
+            relation: rel.relation,
+            date: rel.date,
+            sessionId: session.sessionId,
+          })
+        }
+        totalEntities += parsed.entities.length
+        totalRelationships += parsed.relationships.length
+
+        const dateHeader = `# Memories from ${dateStr}\n\n`
+        const content = dateHeader + parsed.memoriesText
+        const textChunks = chunkText(content)
+
+        for (let i = 0; i < textChunks.length; i++) {
+          allChunks.push({
+            text: textChunks[i],
+            sessionId: session.sessionId,
+            chunkIndex: i,
+            date: dateStr,
+            metadata: {
+              ...session.metadata,
+              memoryDate: dateStr,
+            },
+          })
+        }
       }
-      for (const rel of parsed.relationships) {
-        graph.addRelationship({
-          source: rel.source,
-          target: rel.target,
-          relation: rel.relation,
-          date: rel.date,
-          sessionId: session.sessionId,
-        })
-      }
-      totalEntities += parsed.entities.length
-      totalRelationships += parsed.relationships.length
-
-      // Chunk the memories text (clean text without XML tags)
-      const dateHeader = `# Memories from ${dateStr}\n\n`
-      const content = dateHeader + parsed.memoriesText
-
-      const textChunks = chunkText(content)
-
-      for (let i = 0; i < textChunks.length; i++) {
-        allChunks.push({
-          text: textChunks[i],
-          sessionId: session.sessionId,
-          chunkIndex: i,
-          date: dateStr,
-          metadata: {
-            ...session.metadata,
-            memoryDate: dateStr,
-          },
-        })
-      }
+    } finally {
+      this.containerLock.writeUnlock(options.containerTag)
     }
 
     logger.info(`[ingest] ${options.containerTag}: graph built with ${totalEntities} entities, ${totalRelationships} relationships (${graph.nodeCount} unique nodes, ${graph.edgeCount} edges)`)
@@ -326,8 +370,13 @@ export class RAGProvider implements Provider {
       )
     }
 
-    this.searchEngine.addChunks(options.containerTag, embeddedChunks)
-    this.saveToCache(options.containerTag)
+    await this.containerLock.writeLock(options.containerTag)
+    try {
+      this.searchEngine.addChunks(options.containerTag, embeddedChunks)
+    } finally {
+      this.containerLock.writeUnlock(options.containerTag)
+    }
+    await this.saveToCache(options.containerTag)
 
     const documentIds = embeddedChunks.map((c) => c.id)
     logger.debug(
@@ -354,7 +403,7 @@ export class RAGProvider implements Provider {
 
     // Load cached index if in-memory is empty
     if (!this.searchEngine.hasData(options.containerTag)) {
-      this.loadFromCache(options.containerTag)
+      await this.loadFromCache(options.containerTag)
     }
 
     const embeddingModel = this.openai.embedding(EMBEDDING_MODEL)
@@ -373,59 +422,64 @@ export class RAGProvider implements Provider {
     const limit = options.limit || 10
     const overfetchLimit = Math.max(limit, RERANK_OVERFETCH)
 
-    // Hybrid search (BM25 + vector)
-    const hybridResults = this.searchEngine.search(options.containerTag, queryEmbedding, query, overfetchLimit)
+    await this.containerLock.readLock(options.containerTag)
+    let hybridResults: SearchResult[]
+    let graphResult: GraphSearchResult | null = null
+    try {
+      hybridResults = this.searchEngine.search(options.containerTag, queryEmbedding, query, overfetchLimit)
+
+      const graph = this.graphs.get(options.containerTag)
+      if (graph && graph.nodeCount > 0) {
+        const queryEntities = graph.findEntitiesInQuery(query)
+        if (queryEntities.length > 0) {
+          graphResult = graph.getContext(queryEntities, 2)
+          logger.debug(`Graph: found ${queryEntities.length} entities, added ${graphResult.entities.length} nodes + ${graphResult.relationships.length} edges`)
+        }
+      }
+    } finally {
+      this.containerLock.readUnlock(options.containerTag)
+    }
 
     logger.debug(
       `Hybrid search: ${hybridResults.length} results for "${query.substring(0, 50)}..." (${this.searchEngine.getChunkCount(options.containerTag)} total chunks)`
     )
 
-    // Rerank
     let finalChunks = hybridResults
     if (hybridResults.length > limit) {
       finalChunks = await rerankResults(this.openai, query, hybridResults, limit)
     }
 
-    // Graph search: find entities in query, traverse relationships
-    const graph = this.graphs.get(options.containerTag)
     const combinedResults: unknown[] = [...finalChunks]
 
-    if (graph && graph.nodeCount > 0) {
-      const queryEntities = graph.findEntitiesInQuery(query)
-      if (queryEntities.length > 0) {
-        const graphContext = graph.getContext(queryEntities, 2)
+    if (graphResult) {
+      for (const entity of graphResult.entities) {
+        combinedResults.push({
+          content: entity.summary,
+          _type: "entity",
+          name: entity.name,
+          entityType: entity.type,
+          score: 0,
+          vectorScore: 0,
+          bm25Score: 0,
+          sessionId: "",
+          chunkIndex: -1,
+        })
+      }
 
-        for (const entity of graphContext.entities) {
-          combinedResults.push({
-            content: entity.summary,
-            _type: "entity",
-            name: entity.name,
-            entityType: entity.type,
-            score: 0,
-            vectorScore: 0,
-            bm25Score: 0,
-            sessionId: "",
-            chunkIndex: -1,
-          })
-        }
-
-        for (const rel of graphContext.relationships) {
-          combinedResults.push({
-            content: `${rel.source} ${rel.relation} ${rel.target}`,
-            _type: "relationship",
-            source: rel.source,
-            target: rel.target,
-            relation: rel.relation,
-            date: rel.date,
-            score: 0,
-            vectorScore: 0,
-            bm25Score: 0,
-            sessionId: "",
-            chunkIndex: -1,
-          })
-        }
-
-        logger.debug(`Graph: found ${queryEntities.length} entities, added ${graphContext.entities.length} nodes + ${graphContext.relationships.length} edges`)
+      for (const rel of graphResult.relationships) {
+        combinedResults.push({
+          content: `${rel.source} ${rel.relation} ${rel.target}`,
+          _type: "relationship",
+          source: rel.source,
+          target: rel.target,
+          relation: rel.relation,
+          date: rel.date,
+          score: 0,
+          vectorScore: 0,
+          bm25Score: 0,
+          sessionId: "",
+          chunkIndex: -1,
+        })
       }
     }
 
@@ -433,9 +487,14 @@ export class RAGProvider implements Provider {
   }
 
   async clear(containerTag: string): Promise<void> {
-    this.searchEngine.clear(containerTag)
-    this.graphs.get(containerTag)?.clear()
-    this.graphs.delete(containerTag)
+    await this.containerLock.writeLock(containerTag)
+    try {
+      this.searchEngine.clear(containerTag)
+      this.graphs.get(containerTag)?.clear()
+      this.graphs.delete(containerTag)
+    } finally {
+      this.containerLock.writeUnlock(containerTag)
+    }
     logger.info(`Cleared RAG data for: ${containerTag}`)
   }
 }
