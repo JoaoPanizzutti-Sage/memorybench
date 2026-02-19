@@ -9,6 +9,7 @@ interface RAGSearchResult {
   sessionId: string
   chunkIndex: number
   date?: string
+  eventDate?: string
   metadata?: Record<string, unknown>
   _type?: "chunk" | "entity" | "relationship"
   name?: string
@@ -34,7 +35,8 @@ function buildRAGContext(context: unknown[]): { chunks: string; graphContext: st
     } else {
       const date = result.date || (result.metadata?.memoryDate as string) || undefined
       const dateStr = date ? ` date="${date}"` : ""
-      chunks.push(`<memory session="${result.sessionId}"${dateStr}>
+      const eventDateStr = result.eventDate ? ` eventDate="${result.eventDate}"` : ""
+      chunks.push(`<memory session="${result.sessionId}"${dateStr}${eventDateStr}>
 ${result.content}
 </memory>`)
     }

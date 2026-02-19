@@ -18,6 +18,7 @@ export interface Chunk {
   chunkIndex: number
   embedding: number[]
   date?: string
+  eventDate?: string
   metadata?: Record<string, unknown>
 }
 
@@ -30,6 +31,7 @@ export interface SearchResult {
   sessionId: string
   chunkIndex: number
   date?: string
+  eventDate?: string
   metadata?: Record<string, unknown>
 }
 
@@ -348,6 +350,7 @@ export class HybridSearchEngine {
         sessionId: chunk.sessionId,
         chunkIndex: chunk.chunkIndex,
         date: chunk.date,
+        eventDate: chunk.eventDate,
         metadata: chunk.metadata,
       }
     })

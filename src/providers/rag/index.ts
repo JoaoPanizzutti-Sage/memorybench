@@ -16,6 +16,7 @@ import type { Chunk, SearchResult } from "./search"
 import { RAG_PROMPTS } from "./prompts"
 import { extractMemories, parseExtractionOutput } from "../../prompts/extraction"
 import { rerankResults } from "./reranker"
+import { isCountingQuery, decomposeQuery } from "./decompose"
 import { EntityGraph } from "./graph"
 import type { SerializedGraph, GraphSearchResult } from "./graph"
 import { ContainerLock } from "./lock"
@@ -23,7 +24,7 @@ import { ContainerLock } from "./lock"
 const CHUNK_SIZE = 1600
 const CHUNK_OVERLAP = 320
 const EMBEDDING_BATCH_SIZE = 100
-const EMBEDDING_MODEL = "text-embedding-3-small"
+const EMBEDDING_MODEL = "text-embedding-3-large"
 const RERANK_OVERFETCH = 40
 const EXTRACTION_CONCURRENCY = 10
 const MAX_GLOBAL_EXTRACTIONS = 300
@@ -226,6 +227,7 @@ export class RAGProvider implements Provider {
       sessionId: string
       chunkIndex: number
       date: string
+      eventDate?: string
       metadata?: Record<string, unknown>
     }> = []
 
@@ -343,14 +345,20 @@ export class RAGProvider implements Provider {
       const textChunks = chunkText(content)
 
       for (let i = 0; i < textChunks.length; i++) {
+        const dateMatches = textChunks[i].match(/\[(\d{4}-\d{2}-\d{2})\]/g)
+        const eventDatesInChunk = dateMatches?.map((d) => d.slice(1, -1)).sort() || []
+        const eventDate = eventDatesInChunk[0]
+
         allChunks.push({
           text: textChunks[i],
           sessionId: session.sessionId,
           chunkIndex: i,
           date: dateStr,
+          eventDate,
           metadata: {
             ...session.metadata,
             memoryDate: dateStr,
+            eventDate,
           },
         })
       }
@@ -396,6 +404,7 @@ export class RAGProvider implements Provider {
           chunkIndex: chunk.chunkIndex,
           embedding: embeddings[j],
           date: chunk.date,
+          eventDate: chunk.eventDate,
           metadata: chunk.metadata,
         })
       }
@@ -496,6 +505,38 @@ export class RAGProvider implements Provider {
       logger.debug(`Hybrid search: ${hybridResults.length} results for "${query.substring(0, 50)}..." (${chunkCount} total chunks, pg)`)
     } else {
       logger.debug(`Hybrid search: ${hybridResults.length} results for "${query.substring(0, 50)}..." (${this.searchEngine.getChunkCount(options.containerTag)} total chunks)`)
+    }
+
+    if (isCountingQuery(query)) {
+      const subQueries = await decomposeQuery(this.openai!, query)
+      const existingKeys = new Set(hybridResults.map(r => `${r.sessionId}_${r.chunkIndex}`))
+
+      for (const subQuery of subQueries.slice(1)) {
+        const subEmbed = await embed({ model: embeddingModel, value: subQuery })
+        let subResults: SearchResult[]
+
+        if (this.pgStore) {
+          subResults = await this.pgStore.search(options.containerTag, subEmbed.embedding, subQuery, overfetchLimit)
+        } else {
+          await this.containerLock.readLock(options.containerTag)
+          try {
+            subResults = this.searchEngine.search(options.containerTag, subEmbed.embedding, subQuery, overfetchLimit)
+          } finally {
+            this.containerLock.readUnlock(options.containerTag)
+          }
+        }
+
+        for (const r of subResults) {
+          const key = `${r.sessionId}_${r.chunkIndex}`
+          if (!existingKeys.has(key)) {
+            existingKeys.add(key)
+            hybridResults.push(r)
+          }
+        }
+      }
+
+      hybridResults.sort((a, b) => b.score - a.score)
+      logger.debug(`[decompose] Merged ${hybridResults.length} total results for counting query`)
     }
 
     let finalChunks = hybridResults

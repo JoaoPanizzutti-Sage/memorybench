@@ -9,6 +9,7 @@ export interface ParsedExtraction {
   memoriesText: string
   entities: Array<{ name: string; type: string; summary: string }>
   relationships: Array<{ source: string; relation: string; target: string; date?: string }>
+  eventDates: Map<number, string>
 }
 
 export function buildExtractionPrompt(session: UnifiedSession): string {
@@ -113,7 +114,16 @@ export function parseExtractionOutput(rawText: string): ParsedExtraction {
     }
   }
 
-  return { memoriesText, entities, relationships }
+  const eventDates = new Map<number, string>()
+  const memoryLines = memoriesText.split("\n").filter((l) => l.trim())
+  for (let i = 0; i < memoryLines.length; i++) {
+    const dateMatch = memoryLines[i].match(/^\[(\d{4}-\d{2}-\d{2})\]/)
+    if (dateMatch) {
+      eventDates.set(i, dateMatch[1])
+    }
+  }
+
+  return { memoriesText, entities, relationships, eventDates }
 }
 
 export async function extractMemories(

@@ -5,6 +5,8 @@ import type { RelationshipEdge, GraphSearchResult } from "./graph"
 
 const { Pool } = pg
 
+// changing dims requires DROP TABLE rag_chunks + recreate (CREATE TABLE IF NOT EXISTS won't alter existing columns)
+const EMBEDDING_DIMS = 3072
 const VECTOR_WEIGHT = 0.7
 const BM25_WEIGHT = 0.3
 const MAX_GRAPH_ENTITIES = 10
@@ -37,7 +39,7 @@ export class PgStore {
           content TEXT NOT NULL,
           session_id TEXT NOT NULL,
           chunk_index INTEGER NOT NULL,
-          embedding vector(1536) NOT NULL,
+          embedding vector(${EMBEDDING_DIMS}) NOT NULL,
           date TEXT,
           metadata JSONB
         )
@@ -51,6 +53,8 @@ export class PgStore {
           GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
       `)
       await client.query(`CREATE INDEX IF NOT EXISTS idx_chunks_tsv ON rag_chunks USING gin (content_tsv)`)
+
+      await client.query(`ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS event_date TEXT`)
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS rag_entities (
@@ -95,14 +99,15 @@ export class PgStore {
 
       for (const chunk of chunks) {
         await client.query(
-          `INSERT INTO rag_chunks (id, container_tag, content, session_id, chunk_index, embedding, date, metadata)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          `INSERT INTO rag_chunks (id, container_tag, content, session_id, chunk_index, embedding, date, event_date, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            ON CONFLICT (id) DO UPDATE SET
              content = EXCLUDED.content,
              session_id = EXCLUDED.session_id,
              chunk_index = EXCLUDED.chunk_index,
              embedding = EXCLUDED.embedding,
              date = EXCLUDED.date,
+             event_date = EXCLUDED.event_date,
              metadata = EXCLUDED.metadata`,
           [
             chunk.id,
@@ -112,6 +117,7 @@ export class PgStore {
             chunk.chunkIndex,
             pgvector.toSql(chunk.embedding),
             chunk.date || null,
+            chunk.eventDate || null,
             chunk.metadata ? JSON.stringify(chunk.metadata) : null,
           ]
         )
@@ -136,7 +142,7 @@ export class PgStore {
 
     const { rows } = await this.pool.query(
       `WITH vector_results AS (
-        SELECT id, content, session_id, chunk_index, date, metadata,
+        SELECT id, content, session_id, chunk_index, date, event_date, metadata,
           1 - (embedding <=> $1::vector) AS vector_score
         FROM rag_chunks
         WHERE container_tag = $2
@@ -176,6 +182,7 @@ export class PgStore {
         sessionId: row.session_id,
         chunkIndex: row.chunk_index,
         date: row.date || undefined,
+        eventDate: row.event_date || undefined,
         metadata: row.metadata || undefined,
       }
     })
