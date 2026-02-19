@@ -13,23 +13,18 @@ import { logger } from "../../utils/logger"
 import { HybridSearchEngine } from "./search"
 import type { Chunk } from "./search"
 import { RAG_PROMPTS } from "./prompts"
-import { extractMemories } from "../../prompts/extraction"
+import { extractMemories, parseExtractionOutput } from "../../prompts/extraction"
+import { rerankResults } from "./reranker"
+import { EntityGraph } from "./graph"
 
-/** Target chunk size in characters (~400 tokens) */
 const CHUNK_SIZE = 1600
-/** Overlap between chunks in characters (~80 tokens, matching OpenClaw) */
 const CHUNK_OVERLAP = 320
-/** Maximum chunks to embed in a single API call */
 const EMBEDDING_BATCH_SIZE = 100
-/** Embedding model to use */
 const EMBEDDING_MODEL = "text-embedding-3-small"
+const RERANK_OVERFETCH = 30
+const EXTRACTION_CONCURRENCY = 10
+const MAX_GLOBAL_EXTRACTIONS = 300
 
-// ─── Chunking ────────────────────────────────────────────────────────────────
-
-/**
- * Split text into overlapping chunks, attempting to break on sentence boundaries.
- * Follows the chunking approach from OpenClaw/QMD: ~400 tokens with overlap.
- */
 function chunkText(text: string, chunkSize: number = CHUNK_SIZE, overlap: number = CHUNK_OVERLAP): string[] {
   if (text.length <= chunkSize) {
     return [text.trim()]
@@ -46,7 +41,6 @@ function chunkText(text: string, chunkSize: number = CHUNK_SIZE, overlap: number
       break
     }
 
-    // Try to break on sentence boundary
     let breakPoint = text.lastIndexOf(". ", end)
     if (breakPoint <= start || breakPoint < start + chunkSize * 0.5) {
       breakPoint = text.lastIndexOf("\n", end)
@@ -67,35 +61,49 @@ function chunkText(text: string, chunkSize: number = CHUNK_SIZE, overlap: number
   return chunks.filter((c) => c.length > 0)
 }
 
-// ─── Provider ────────────────────────────────────────────────────────────────
-
-/**
- * RAG Memory Provider
- *
- * Implements the hybrid BM25 + vector search approach used by OpenClaw's memory
- * system and QMD (Quick Markdown Search):
- *
- * - Ingestion: Extracts structured memories via LLM (like OpenClaw's pre-compaction
- *   flush), then chunks the extracted content into ~400-token pieces with overlap,
- *   generates embeddings via OpenAI text-embedding-3-small
- * - Search: Hybrid scoring combining BM25 keyword matching (30%) with
- *   vector cosine similarity (70%), following OpenClaw's formula
- * - Date-organized: Extracted memories include date context (like OpenClaw's
- *   memory/YYYY-MM-DD.md daily logs)
- * - No external memory service required - all local except for LLM + embedding API
- */
 export class RAGProvider implements Provider {
   name = "rag"
   prompts = RAG_PROMPTS
   concurrency = {
-    default: 20,
-    ingest: 10,
-    indexing: 50,
+    default: 200,
+    ingest: 200,
+    indexing: 200,
   }
 
   private searchEngine = new HybridSearchEngine()
+  private graphs = new Map<string, EntityGraph>()
   private openai: ReturnType<typeof createOpenAI> | null = null
   private apiKey: string = ""
+  private extractionCache = new Map<string, string>()
+  private extractionInFlight = new Map<string, Promise<string>>()
+  private activeGlobalExtractions = 0
+  private extractionQueue: Array<() => void> = []
+
+  private async acquireExtractionSlot(): Promise<void> {
+    if (this.activeGlobalExtractions < MAX_GLOBAL_EXTRACTIONS) {
+      this.activeGlobalExtractions++
+      return
+    }
+    return new Promise((resolve) => {
+      this.extractionQueue.push(() => {
+        this.activeGlobalExtractions++
+        resolve()
+      })
+    })
+  }
+
+  private releaseExtractionSlot(): void {
+    this.activeGlobalExtractions--
+    const next = this.extractionQueue.shift()
+    if (next) next()
+  }
+
+  private getGraph(containerTag: string): EntityGraph {
+    if (!this.graphs.has(containerTag)) {
+      this.graphs.set(containerTag, new EntityGraph())
+    }
+    return this.graphs.get(containerTag)!
+  }
 
   async initialize(config: ProviderConfig): Promise<void> {
     this.apiKey = config.apiKey
@@ -103,11 +111,13 @@ export class RAGProvider implements Provider {
       throw new Error("RAG provider requires OPENAI_API_KEY for memory extraction and embeddings")
     }
     this.openai = createOpenAI({ apiKey: this.apiKey })
-    logger.info("Initialized RAG memory provider (OpenClaw/QMD-style with LLM extraction + hybrid search)")
+    logger.info("Initialized RAG provider (hybrid search + entity graph + LLM reranker)")
   }
 
   async ingest(sessions: UnifiedSession[], options: IngestOptions): Promise<IngestResult> {
     if (!this.openai) throw new Error("Provider not initialized")
+
+    const graph = this.getGraph(options.containerTag)
 
     const allChunks: Array<{
       text: string
@@ -117,17 +127,94 @@ export class RAGProvider implements Provider {
       metadata?: Record<string, unknown>
     }> = []
 
-    // Step 1: Extract memories from each session via LLM, then chunk
-    for (const session of sessions) {
-      const extracted = await extractMemories(this.openai, session)
+    let activeExtractions = 0
+    let completedExtractions = 0
+    let cachedHits = 0
+    let dedupHits = 0
 
-      // Extract ISO date for OpenClaw-style date organization
+    const extractSession = async (session: UnifiedSession): Promise<string> => {
+      if (this.extractionCache.has(session.sessionId)) {
+        cachedHits++
+        return this.extractionCache.get(session.sessionId)!
+      }
+      if (this.extractionInFlight.has(session.sessionId)) {
+        dedupHits++
+        return this.extractionInFlight.get(session.sessionId)!
+      }
+      activeExtractions++
+      const doExtract = async (): Promise<string> => {
+        await this.acquireExtractionSlot()
+        try {
+          logger.info(`[extract] START ${session.sessionId} (active: ${activeExtractions}, global: ${this.activeGlobalExtractions}/${MAX_GLOBAL_EXTRACTIONS}, queue: ${this.extractionQueue.length})`)
+          return await extractMemories(this.openai!, session)
+        } finally {
+          this.releaseExtractionSlot()
+        }
+      }
+      const promise = doExtract()
+      this.extractionInFlight.set(session.sessionId, promise)
+      try {
+        const result = await promise
+        this.extractionCache.set(session.sessionId, result)
+        activeExtractions--
+        completedExtractions++
+        if (completedExtractions % 10 === 0 || completedExtractions <= 3) {
+          logger.info(`[extract] DONE ${session.sessionId} (completed: ${completedExtractions}, cached: ${cachedHits}, dedup: ${dedupHits}, global: ${this.activeGlobalExtractions}/${MAX_GLOBAL_EXTRACTIONS})`)
+        }
+        return result
+      } catch (e) {
+        activeExtractions--
+        throw e
+      } finally {
+        this.extractionInFlight.delete(session.sessionId)
+      }
+    }
+
+    logger.info(`[ingest] ${options.containerTag}: ${sessions.length} sessions, extraction concurrency: ${EXTRACTION_CONCURRENCY}`)
+
+    const extractions: string[] = []
+    for (let i = 0; i < sessions.length; i += EXTRACTION_CONCURRENCY) {
+      const batch = sessions.slice(i, i + EXTRACTION_CONCURRENCY)
+      const batchNum = Math.floor(i / EXTRACTION_CONCURRENCY) + 1
+      const totalBatches = Math.ceil(sessions.length / EXTRACTION_CONCURRENCY)
+      logger.info(`[ingest] ${options.containerTag}: extraction batch ${batchNum}/${totalBatches} (${batch.length} sessions)`)
+      const results = await Promise.all(batch.map(extractSession))
+      extractions.push(...results)
+    }
+
+    // Parse extractions: build graph + prepare chunk text
+    let totalEntities = 0
+    let totalRelationships = 0
+
+    for (let si = 0; si < sessions.length; si++) {
+      const session = sessions[si]
+      const rawExtraction = extractions[si]
+
       const isoDate = (session.metadata?.date as string) || "unknown"
       const dateStr = isoDate !== "unknown" ? isoDate.split("T")[0] : "unknown"
 
-      // Prepend date context (like OpenClaw's memory/YYYY-MM-DD.md)
+      // Parse structured extraction output
+      const parsed = parseExtractionOutput(rawExtraction)
+
+      // Build entity graph
+      for (const entity of parsed.entities) {
+        graph.addEntity(entity.name, entity.type, entity.summary, session.sessionId)
+      }
+      for (const rel of parsed.relationships) {
+        graph.addRelationship({
+          source: rel.source,
+          target: rel.target,
+          relation: rel.relation,
+          date: rel.date,
+          sessionId: session.sessionId,
+        })
+      }
+      totalEntities += parsed.entities.length
+      totalRelationships += parsed.relationships.length
+
+      // Chunk the memories text (clean text without XML tags)
       const dateHeader = `# Memories from ${dateStr}\n\n`
-      const content = dateHeader + extracted
+      const content = dateHeader + parsed.memoriesText
 
       const textChunks = chunkText(content)
 
@@ -145,11 +232,13 @@ export class RAGProvider implements Provider {
       }
     }
 
+    logger.info(`[ingest] ${options.containerTag}: graph built with ${totalEntities} entities, ${totalRelationships} relationships (${graph.nodeCount} unique nodes, ${graph.edgeCount} edges)`)
+
     if (allChunks.length === 0) {
       return { documentIds: [] }
     }
 
-    // Step 2: Generate embeddings in batches
+    // Generate embeddings in batches
     const embeddedChunks: Chunk[] = []
     const embeddingModel = this.openai.embedding(EMBEDDING_MODEL)
 
@@ -157,10 +246,17 @@ export class RAGProvider implements Provider {
       const batch = allChunks.slice(i, i + EMBEDDING_BATCH_SIZE)
       const texts = batch.map((c) => c.text)
 
-      const { embeddings } = await embedMany({
-        model: embeddingModel,
-        values: texts,
-      })
+      let embeddings: number[][]
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const result = await embedMany({ model: embeddingModel, values: texts })
+          embeddings = result.embeddings
+          break
+        } catch (e) {
+          if (attempt >= 2) throw e
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+        }
+      }
 
       for (let j = 0; j < batch.length; j++) {
         const chunk = batch[j]
@@ -181,12 +277,11 @@ export class RAGProvider implements Provider {
       )
     }
 
-    // Step 3: Add to search engine
     this.searchEngine.addChunks(options.containerTag, embeddedChunks)
 
     const documentIds = embeddedChunks.map((c) => c.id)
     logger.debug(
-      `Ingested ${sessions.length} session(s) as ${embeddedChunks.length} extracted memory chunks for ${options.containerTag}`
+      `Ingested ${sessions.length} session(s) as ${embeddedChunks.length} chunks for ${options.containerTag}`
     )
 
     return { documentIds }
@@ -197,7 +292,6 @@ export class RAGProvider implements Provider {
     _containerTag: string,
     onProgress?: IndexingProgressCallback
   ): Promise<void> {
-    // Indexing happens synchronously during ingest (embedding generation)
     onProgress?.({
       completedIds: result.documentIds,
       failedIds: [],
@@ -208,28 +302,85 @@ export class RAGProvider implements Provider {
   async search(query: string, options: SearchOptions): Promise<unknown[]> {
     if (!this.openai) throw new Error("Provider not initialized")
 
-    // Generate query embedding
     const embeddingModel = this.openai.embedding(EMBEDDING_MODEL)
-    const { embedding: queryEmbedding } = await embed({
-      model: embeddingModel,
-      value: query,
-    })
+    let queryEmbedding: number[]
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await embed({ model: embeddingModel, value: query })
+        queryEmbedding = result.embedding
+        break
+      } catch (e) {
+        if (attempt >= 2) throw e
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+      }
+    }
 
     const limit = options.limit || 10
+    const overfetchLimit = Math.max(limit, RERANK_OVERFETCH)
 
-    // Hybrid search
-    const results = this.searchEngine.search(options.containerTag, queryEmbedding, query, limit)
+    // Hybrid search (BM25 + vector)
+    const hybridResults = this.searchEngine.search(options.containerTag, queryEmbedding, query, overfetchLimit)
 
     logger.debug(
-      `Search returned ${results.length} results for "${query.substring(0, 50)}..." ` +
-        `(${this.searchEngine.getChunkCount(options.containerTag)} total chunks)`
+      `Hybrid search: ${hybridResults.length} results for "${query.substring(0, 50)}..." (${this.searchEngine.getChunkCount(options.containerTag)} total chunks)`
     )
 
-    return results
+    // Rerank
+    let finalChunks = hybridResults
+    if (hybridResults.length > limit) {
+      finalChunks = await rerankResults(this.openai, query, hybridResults, limit)
+    }
+
+    // Graph search: find entities in query, traverse relationships
+    const graph = this.graphs.get(options.containerTag)
+    const combinedResults: unknown[] = [...finalChunks]
+
+    if (graph && graph.nodeCount > 0) {
+      const queryEntities = graph.findEntitiesInQuery(query)
+      if (queryEntities.length > 0) {
+        const graphContext = graph.getContext(queryEntities, 2)
+
+        for (const entity of graphContext.entities) {
+          combinedResults.push({
+            content: entity.summary,
+            _type: "entity",
+            name: entity.name,
+            entityType: entity.type,
+            score: 0,
+            vectorScore: 0,
+            bm25Score: 0,
+            sessionId: "",
+            chunkIndex: -1,
+          })
+        }
+
+        for (const rel of graphContext.relationships) {
+          combinedResults.push({
+            content: `${rel.source} ${rel.relation} ${rel.target}`,
+            _type: "relationship",
+            source: rel.source,
+            target: rel.target,
+            relation: rel.relation,
+            date: rel.date,
+            score: 0,
+            vectorScore: 0,
+            bm25Score: 0,
+            sessionId: "",
+            chunkIndex: -1,
+          })
+        }
+
+        logger.debug(`Graph: found ${queryEntities.length} entities, added ${graphContext.entities.length} nodes + ${graphContext.relationships.length} edges`)
+      }
+    }
+
+    return combinedResults
   }
 
   async clear(containerTag: string): Promise<void> {
     this.searchEngine.clear(containerTag)
+    this.graphs.get(containerTag)?.clear()
+    this.graphs.delete(containerTag)
     logger.info(`Cleared RAG data for: ${containerTag}`)
   }
 }

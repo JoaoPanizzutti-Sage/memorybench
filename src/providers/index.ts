@@ -5,10 +5,12 @@ import { Mem0Provider } from "./mem0"
 import { ZepProvider } from "./zep"
 import { FilesystemProvider } from "./filesystem"
 import { RAGProvider } from "./rag"
+import { Mem0LocalProvider } from "./mem0-local"
 
 const providers: Record<ProviderName, new () => Provider> = {
   supermemory: SupermemoryProvider,
   mem0: Mem0Provider,
+  "mem0-local": Mem0LocalProvider,
   zep: ZepProvider,
   filesystem: FilesystemProvider,
   rag: RAGProvider,
@@ -39,4 +41,4 @@ export function getProviderInfo(name: ProviderName): {
   }
 }
 
-export { SupermemoryProvider, Mem0Provider, ZepProvider, FilesystemProvider, RAGProvider }
+export { SupermemoryProvider, Mem0Provider, Mem0LocalProvider, ZepProvider, FilesystemProvider, RAGProvider }

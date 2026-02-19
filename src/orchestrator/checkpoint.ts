@@ -78,20 +78,21 @@ export class CheckpointManager {
     const path = this.getCheckpointPath(checkpoint.runId)
     const tempPath = path + ".tmp"
 
-    if (!existsSync(runPath)) {
-      mkdirSync(runPath, { recursive: true })
-    }
-
     checkpoint.updatedAt = new Date().toISOString()
 
-    try {
-      writeFileSync(tempPath, JSON.stringify(checkpoint, null, 2))
-      renameSync(tempPath, path)
-    } catch (e) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        unlinkSync(tempPath)
-      } catch {}
-      throw e
+        if (!existsSync(runPath)) {
+          mkdirSync(runPath, { recursive: true })
+        }
+        writeFileSync(tempPath, JSON.stringify(checkpoint, null, 2))
+        renameSync(tempPath, path)
+        return
+      } catch (e) {
+        try { unlinkSync(tempPath) } catch {}
+        if (attempt === 2) throw e
+        await new Promise((r) => setTimeout(r, 50))
+      }
     }
   }
 

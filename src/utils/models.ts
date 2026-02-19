@@ -6,6 +6,7 @@ export interface ModelConfig {
   defaultTemperature: number
   maxTokensParam: "maxTokens" | "max_completion_tokens" | "maxOutputTokens"
   defaultMaxTokens: number
+  reasoningEffort?: "low" | "medium" | "high"
 }
 
 export const MODEL_CONFIGS: Record<string, ModelConfig> = {
@@ -64,7 +65,8 @@ export const MODEL_CONFIGS: Record<string, ModelConfig> = {
     supportsTemperature: false,
     defaultTemperature: 1,
     maxTokensParam: "max_completion_tokens",
-    defaultMaxTokens: 1000,
+    defaultMaxTokens: 8192,
+    reasoningEffort: "medium",
   },
   "gpt-5-mini": {
     id: "gpt-5-mini",

@@ -33,6 +33,21 @@ A pluggable benchmarking framework for evaluating memory and context systems.
    └────────┴─────────┴────────┴──────────┴────────┘
 ```
 
+## Benchmark Results
+
+LongMemEval (500 questions, 115k+ tokens):
+
+| Provider | Accuracy |
+|----------|----------|
+| Supermemory | 85.9% |
+| **RAG Provider (ours)** | **80.8%** |
+| OpenClaw QMD | 58.3% |
+| Filesystem | 54.2% |
+
+Our open-source RAG provider closes 83% of the gap between OpenClaw's default memory and Supermemory's proprietary API, with no external memory service.
+
+Full breakdown in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+
 ## Quick Start
 
 ```bash

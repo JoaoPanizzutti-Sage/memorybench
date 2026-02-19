@@ -1,15 +1,16 @@
 import { createOpenAI } from "@ai-sdk/openai"
 import { generateText } from "ai"
 import type { UnifiedSession } from "../types/unified"
+import { logger } from "../utils/logger"
 
-/** Model used for memory extraction (fast, cheap, sufficient for extraction) */
-const EXTRACTION_MODEL = "gpt-4o-mini"
+const EXTRACTION_MODEL = "gpt-5-mini"
 
-/**
- * Build an extraction prompt that instructs the LLM to extract structured
- * memories from a conversation session. Produces MEMORY.md-style markdown
- * with categorized facts, events, preferences, and relationships.
- */
+export interface ParsedExtraction {
+  memoriesText: string
+  entities: Array<{ name: string; type: string; summary: string }>
+  relationships: Array<{ source: string; relation: string; target: string; date?: string }>
+}
+
 export function buildExtractionPrompt(session: UnifiedSession): string {
   const speakerA = (session.metadata?.speakerA as string) || "Speaker A"
   const speakerB = (session.metadata?.speakerB as string) || "Speaker B"
@@ -26,62 +27,123 @@ export function buildExtractionPrompt(session: UnifiedSession): string {
     })
     .join("\n")
 
-  return `You are a memory extraction system. Read the following conversation and extract all important, memorable information into structured markdown. This will be stored as a memory file for later retrieval.
+  return `You are a memory extraction system. Extract all important information from this conversation into a structured format for later retrieval.
 
+<context>
 Conversation Date: ${date}
 Participants: ${speakerA}, ${speakerB}
+</context>
 
 <conversation>
 ${conversation}
 </conversation>
 
-Extract memories into the following structured markdown format. Only include sections that have content. Be specific and include names, dates, and details.
+Extract information in this exact format:
 
-## Key Facts
-- [Personal details, biographical information, skills, jobs, locations, ages, physical descriptions, etc.]
-
-## Preferences
-- [Likes, dislikes, preferences, opinions, favorites, etc.]
-
-## Events
-- [${date}]: [Things that happened or were discussed, plans made, activities described]
-
-## Relationships
-- [Relationships between people, pets, family members, friends, colleagues, etc.]
-
-## Decisions & Plans
-- [Decisions made, future plans, goals, commitments, scheduled events, etc.]
+<memories>
+Write each memory as a standalone, self-contained fact. Anyone reading a single line should understand it without needing other lines for context.
 
 Rules:
-- Extract ONLY from what was explicitly stated in the conversation
-- Use the speakers' actual names when known, never "the user" or "the assistant"
-- Include specific dates, numbers, and proper nouns when mentioned
-- Each bullet point should be a self-contained fact (understandable without context)
-- For events, always prefix with the date in [brackets]
-- Do not invent or infer information that was not stated
-- If a section would be empty, omit it entirely
-- Keep each bullet concise but complete (one line per fact)
-- Resolve relative date references ("yesterday", "last week") to absolute dates using the conversation date when possible`
+- Prefix every memory with the date in [YYYY-MM-DD] format
+- Resolve ALL relative dates to absolute dates using conversation date ${date}
+  "yesterday" = day before ${date}, "last week" = 7 days before, "next Friday" = calculate from ${date}, "two months ago" = calculate from ${date}
+- If a message has an explicit timestamp, use that exact date
+- Use actual names from the conversation, never "the user" or "the assistant"
+- Include specific numbers, dates, locations, proper nouns
+- One fact per line, no bullet points or dashes
+- Cover: biographical facts, preferences, opinions, events, plans, decisions, activities, emotions, routines, skills, health, work, relationships
+- For recurring events or habits, note the pattern (e.g., "every Tuesday", "weekly")
+</memories>
+
+<entities>
+List each unique person, organization, location, or notable object mentioned.
+One per line, pipe-delimited: name|type|one-sentence summary of all known facts
+
+Types: person, organization, location, object
+
+Use the entity's actual name. Summary should combine ALL known facts about this entity from the conversation.
+Do not use the pipe character (|) within any field value. Use a comma or semicolon instead.
+</entities>
+
+<relationships>
+List relationships between entities.
+One per line, pipe-delimited: source|relation|target|date-or-timeframe
+
+Relations: married_to, partner_of, parent_of, child_of, sibling_of, friend_of, colleague_of, works_at, lives_in, studies_at, member_of, owns, manages, reports_to, visited, likes, dislikes, etc.
+
+Only include relationships explicitly stated or strongly implied. Include temporal info when known. Use entity names exactly as in the entities section.
+</relationships>`
 }
 
-/**
- * Call LLM to extract structured memories from a conversation session.
- * Returns MEMORY.md-style markdown with categorized facts, events, preferences.
- */
+export function parseExtractionOutput(rawText: string): ParsedExtraction {
+  const memoriesMatch = rawText.match(/<memories>([\s\S]*?)<\/memories>/)
+  const memoriesText = memoriesMatch
+    ? memoriesMatch[1].trim()
+    : rawText
+        .replace(/<entities>[\s\S]*?<\/entities>/g, "")
+        .replace(/<relationships>[\s\S]*?<\/relationships>/g, "")
+        .trim()
+
+  const entities: ParsedExtraction["entities"] = []
+  const entitiesMatch = rawText.match(/<entities>([\s\S]*?)<\/entities>/)
+  if (entitiesMatch) {
+    for (const line of entitiesMatch[1].trim().split("\n")) {
+      if (!line.trim() || !line.includes("|")) continue
+      const parts = line.split("|").map((p) => p.trim())
+      if (parts.length >= 3 && parts[0] && parts[1] && parts[2]) {
+        entities.push({ name: parts[0], type: parts[1], summary: parts.slice(2).join("|") })
+      }
+    }
+  }
+
+  const relationships: ParsedExtraction["relationships"] = []
+  const relsMatch = rawText.match(/<relationships>([\s\S]*?)<\/relationships>/)
+  if (relsMatch) {
+    for (const line of relsMatch[1].trim().split("\n")) {
+      if (!line.trim() || !line.includes("|")) continue
+      const parts = line.split("|").map((p) => p.trim())
+      if (parts.length >= 3 && parts[0] && parts[1] && parts[2]) {
+        relationships.push({
+          source: parts[0],
+          relation: parts[1],
+          target: parts[2],
+          date: parts[3] || undefined,
+        })
+      }
+    }
+  }
+
+  return { memoriesText, entities, relationships }
+}
+
 export async function extractMemories(
   openai: ReturnType<typeof createOpenAI>,
-  session: UnifiedSession
+  session: UnifiedSession,
+  maxRetries = 5
 ): Promise<string> {
   const prompt = buildExtractionPrompt(session)
 
-  const params: Record<string, unknown> = {
-    model: openai(EXTRACTION_MODEL),
-    prompt,
-    maxTokens: 2000,
-    temperature: 0,
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        logger.info(`[extraction] Retry ${attempt}/${maxRetries} for ${session.sessionId}`)
+      }
+      const { text } = await generateText({
+        model: openai(EXTRACTION_MODEL),
+        prompt,
+      } as Parameters<typeof generateText>[0])
+      return text.trim()
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e)
+      const errCode = (e as any)?.code || (e as any)?.status || "unknown"
+      logger.warn(
+        `[extraction] ${session.sessionId} attempt ${attempt + 1}/${maxRetries} failed: [${errCode}] ${errMsg.substring(0, 150)}`
+      )
+      if (attempt === maxRetries - 1) throw e
+      const delay = 2000 * Math.pow(2, attempt)
+      logger.info(`[extraction] Waiting ${delay}ms before retry...`)
+      await new Promise((r) => setTimeout(r, delay))
+    }
   }
-
-  const { text } = await generateText(params as Parameters<typeof generateText>[0])
-
-  return text.trim()
+  throw new Error("unreachable")
 }

@@ -30,7 +30,6 @@ export class GoogleJudge implements Judge {
     const params: Record<string, unknown> = {
       model: this.client(this.modelConfig.id),
       prompt,
-      maxTokens: this.modelConfig.defaultMaxTokens,
     }
 
     if (this.modelConfig.supportsTemperature) {

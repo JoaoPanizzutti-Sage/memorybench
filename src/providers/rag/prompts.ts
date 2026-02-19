@@ -5,34 +5,57 @@ interface RAGSearchResult {
   score: number
   vectorScore: number
   bm25Score: number
+  rerankScore?: number
   sessionId: string
   chunkIndex: number
   date?: string
   metadata?: Record<string, unknown>
+  _type?: "chunk" | "entity" | "relationship"
+  name?: string
+  entityType?: string
+  source?: string
+  target?: string
+  relation?: string
 }
 
-function buildRAGContext(context: unknown[]): string {
+function buildRAGContext(context: unknown[]): { chunks: string; graphContext: string } {
   const results = context as RAGSearchResult[]
 
-  if (results.length === 0) {
-    return "No relevant memory chunks were retrieved."
+  const chunks: string[] = []
+  const entities: string[] = []
+  const relationships: string[] = []
+
+  for (const result of results) {
+    if (result._type === "entity") {
+      entities.push(`- ${result.name} (${result.entityType}): ${result.content}`)
+    } else if (result._type === "relationship") {
+      const dateStr = result.date ? ` [${result.date}]` : ""
+      relationships.push(`- ${result.source} -${result.relation}-> ${result.target}${dateStr}`)
+    } else {
+      const date = result.date || (result.metadata?.memoryDate as string) || undefined
+      const dateStr = date ? ` date="${date}"` : ""
+      chunks.push(`<memory session="${result.sessionId}"${dateStr}>
+${result.content}
+</memory>`)
+    }
   }
 
-  return results
-    .map((result, i) => {
-      const scoreParts = [
-        `hybrid: ${result.score.toFixed(3)}`,
-        `semantic: ${result.vectorScore.toFixed(3)}`,
-        `keyword: ${result.bm25Score.toFixed(3)}`,
-      ].join(", ")
+  let graphContext = ""
+  if (entities.length > 0 || relationships.length > 0) {
+    const parts: string[] = []
+    if (entities.length > 0) {
+      parts.push(`<entities>\n${entities.join("\n")}\n</entities>`)
+    }
+    if (relationships.length > 0) {
+      parts.push(`<relationships>\n${relationships.join("\n")}\n</relationships>`)
+    }
+    graphContext = parts.join("\n")
+  }
 
-      const date = result.date || (result.metadata?.date as string) || undefined
-      const dateStr = date ? ` | Date: ${date}` : ""
-
-      return `[Chunk ${i + 1}] (session: ${result.sessionId}, scores: ${scoreParts}${dateStr})
-${result.content}`
-    })
-    .join("\n\n---\n\n")
+  return {
+    chunks: chunks.length > 0 ? chunks.join("\n\n") : "No relevant memory chunks retrieved.",
+    graphContext,
+  }
 }
 
 export function buildRAGAnswerPrompt(
@@ -40,44 +63,65 @@ export function buildRAGAnswerPrompt(
   context: unknown[],
   questionDate?: string
 ): string {
-  const retrievedContext = buildRAGContext(context)
+  const { chunks, graphContext } = buildRAGContext(context)
 
-  return `You are a question-answering system. Based on the retrieved memory chunks below, answer the question.
+  const graphSection = graphContext
+    ? `\n<knowledge_graph>\n${graphContext}\n</knowledge_graph>\n`
+    : ""
+
+  return `You are a question-answering system. Based on the retrieved context below, answer the question.
 
 Question: ${question}
 Question Date: ${questionDate || "Not specified"}
-
-Retrieved Memory Chunks (ranked by hybrid BM25 + vector relevance):
-${retrievedContext}
+${graphSection}
+<retrieved_memories>
+${chunks}
+</retrieved_memories>
 
 **Understanding the Context:**
-The context contains memory chunks retrieved via hybrid search (BM25 keyword matching + vector semantic similarity). Each chunk is a passage from an extracted memory file containing curated facts, events, preferences, and relationships -- NOT raw conversation text.
-
-- **Higher hybrid scores** indicate stronger relevance
-- **Semantic score** measures meaning-level similarity to your question
-- **Keyword score** measures direct term overlap with your question
-- **Date** indicates when the original conversation took place
-- Chunks from the same session are from the same memory extraction
+The context contains memories extracted from past conversations. Each memory has:
+1. **Content**: extracted facts, preferences, events, and details from conversations
+2. **Date**: when the event/conversation occurred (in YYYY-MM-DD format)
+3. **Knowledge Graph** (if present): entity relationships useful for multi-hop questions
 
 **How to Answer:**
-1. Start with the highest-scored chunks as they are most likely relevant
-2. Look for specific facts, names, dates, preferences, and relationships in the structured memory content
-3. Cross-reference information across chunks from the same or different sessions
-4. For temporal questions, use the chunk dates and any date references within the memory text
-5. Synthesize information from multiple chunks if needed
 
-Instructions:
-- Base your answer ONLY on the provided chunks
-- The chunks contain curated, extracted memories -- look for direct matches to the question
-- If the chunks contain enough information, provide a clear, concise answer
-- If the chunks do not contain enough information, respond with "I don't know"
-- Pay attention to temporal context for time-based questions
+1. Base your answer ONLY on the provided context. Never use outside knowledge.
+
+2. **Temporal questions** (how many days/weeks/months ago, what order, when):
+   - The Question Date above is YOUR reference point. Calculate ALL relative time differences from the Question Date, NOT from today.
+   - Example: If Question Date is 2023-06-22 and a memory is dated 2023-06-15, that event was 7 days ago.
+   - Show your date math explicitly: "Event date: 2023-06-15. Question date: 2023-06-22. Difference: 7 days."
+   - If the question asks about something that hasn't happened yet according to the memories, say so.
+
+3. **Suggestion/preference questions** (recommend, suggest, any tips, what should I):
+   - Use the retrieved memories to understand the user's preferences, experiences, and interests.
+   - Synthesize personalized suggestions based on what you know about the user.
+   - Example: If memories show the user owns a Sony camera, suggest Sony-compatible accessories.
+   - Example: If memories show the user made a great beef stew in their slow cooker, use that as a basis for advice.
+   - Do NOT say "I don't know" if the context contains relevant preferences or experiences you can build on.
+
+4. **Knowledge-update questions** (information that changes over time):
+   - When the same topic appears at different dates with different values, the MOST RECENT memory is the current state.
+   - Earlier values are outdated. Answer with the latest value only.
+
+5. **Multi-hop/relationship questions**:
+   - Use the knowledge graph to trace entity connections.
+   - Follow relationship chains (e.g., "What does X's wife do?" = find spouse, then find their job).
+
+6. **When to say "I don't know"**:
+   - ONLY when the context genuinely contains no relevant information about the topic.
+   - If the question asks about entity X but memories only mention entity Y, that is not enough.
+   - Do NOT say "I don't know" just because the question asks for a suggestion or opinion. If you have context about the user's preferences, use it.
+
+**Response Format:**
+Think step by step, then provide your answer.
 
 Reasoning:
-[Your step-by-step reasoning process here]
+[Your step-by-step reasoning here. For temporal questions, show date calculations explicitly.]
 
 Answer:
-[Your final answer here]`
+[Your final answer here. Be specific: use names, dates, numbers.]`
 }
 
 export const RAG_PROMPTS: ProviderPrompts = {

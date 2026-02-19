@@ -62,19 +62,20 @@ export async function runIngestPhase(
           checkpoint.questions[question.questionId].phases.ingest.completedSessions
         const combinedResult: IngestResult = { documentIds: [], taskIds: [] }
 
-        for (const session of sessions) {
-          if (completedSessions.includes(session.sessionId)) {
-            continue
-          }
+        const completedSet = new Set(completedSessions)
+        const remainingSessions = sessions.filter((s) => !completedSet.has(s.sessionId))
 
-          const result = await provider.ingest([session], { containerTag })
+        if (remainingSessions.length > 0) {
+          const result = await provider.ingest(remainingSessions, { containerTag })
 
           combinedResult.documentIds.push(...result.documentIds)
           if (result.taskIds) {
             combinedResult.taskIds!.push(...result.taskIds)
           }
 
-          completedSessions.push(session.sessionId)
+          for (const s of remainingSessions) {
+            completedSessions.push(s.sessionId)
+          }
           checkpointManager.updatePhase(checkpoint, question.questionId, "ingest", {
             completedSessions,
           })

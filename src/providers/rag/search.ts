@@ -26,6 +26,7 @@ export interface SearchResult {
   score: number
   vectorScore: number
   bm25Score: number
+  rerankScore?: number
   sessionId: string
   chunkIndex: number
   date?: string
@@ -161,13 +162,10 @@ const BM25_K1 = 1.2
 const BM25_B = 0.75
 
 interface BM25Index {
-  /** Inverted index: term -> Map<chunkId, termFrequency> */
   invertedIndex: Map<string, Map<string, number>>
-  /** Document lengths (in tokens) */
   docLengths: Map<string, number>
-  /** Average document length */
   avgDocLength: number
-  /** Total number of documents */
+  totalLength: number
   docCount: number
 }
 
@@ -176,21 +174,24 @@ function createBM25Index(): BM25Index {
     invertedIndex: new Map(),
     docLengths: new Map(),
     avgDocLength: 0,
+    totalLength: 0,
     docCount: 0,
   }
 }
 
 function addToBM25Index(index: BM25Index, chunkId: string, text: string): void {
+  // Guard against duplicate inserts (crash recovery)
+  const oldLength = index.docLengths.get(chunkId)
+  if (oldLength !== undefined) {
+    index.totalLength -= oldLength
+    index.docCount--
+  }
+
   const tokens = tokenize(text)
   index.docLengths.set(chunkId, tokens.length)
   index.docCount++
-
-  // Update average document length
-  let totalLength = 0
-  for (const len of index.docLengths.values()) {
-    totalLength += len
-  }
-  index.avgDocLength = totalLength / index.docCount
+  index.totalLength += tokens.length
+  index.avgDocLength = index.totalLength / index.docCount
 
   // Build term frequency map
   const termFreqs = new Map<string, number>()

@@ -123,11 +123,14 @@ export async function runAnswerPhase(
         const params: Record<string, unknown> = {
           model: client(modelConfig.id),
           prompt,
-          maxTokens: modelConfig.defaultMaxTokens,
         }
 
         if (modelConfig.supportsTemperature) {
           params.temperature = modelConfig.defaultTemperature
+        }
+
+        if (modelConfig.reasoningEffort && modelConfig.provider === "openai") {
+          params.providerOptions = { openai: { reasoningEffort: modelConfig.reasoningEffort } }
         }
 
         const { text } = await generateText(params as Parameters<typeof generateText>[0])
