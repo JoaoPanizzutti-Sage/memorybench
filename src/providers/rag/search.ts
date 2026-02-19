@@ -353,11 +353,72 @@ export class HybridSearchEngine {
     })
   }
 
+  save(containerTag: string): { chunks: Chunk[]; bm25: SerializedBM25 } | null {
+    const container = this.containers.get(containerTag)
+    if (!container) return null
+
+    return {
+      chunks: [...container.chunks.values()],
+      bm25: serializeBM25(container.bm25Index),
+    }
+  }
+
+  load(containerTag: string, data: { chunks: Chunk[]; bm25: SerializedBM25 }): void {
+    const bm25Index = deserializeBM25(data.bm25)
+    const chunks = new Map<string, Chunk>()
+    for (const chunk of data.chunks) {
+      chunks.set(chunk.id, chunk)
+    }
+    this.containers.set(containerTag, { chunks, bm25Index })
+  }
+
+  hasData(containerTag: string): boolean {
+    return (this.containers.get(containerTag)?.chunks.size || 0) > 0
+  }
+
   clear(containerTag: string): void {
     this.containers.delete(containerTag)
   }
 
   getChunkCount(containerTag: string): number {
     return this.containers.get(containerTag)?.chunks.size || 0
+  }
+}
+
+// BM25 serialization (Maps -> plain objects for JSON)
+
+interface SerializedBM25 {
+  invertedIndex: Record<string, Record<string, number>>
+  docLengths: Record<string, number>
+  avgDocLength: number
+  totalLength: number
+  docCount: number
+}
+
+function serializeBM25(index: BM25Index): SerializedBM25 {
+  const invertedIndex: Record<string, Record<string, number>> = {}
+  for (const [term, postings] of index.invertedIndex) {
+    invertedIndex[term] = Object.fromEntries(postings)
+  }
+  return {
+    invertedIndex,
+    docLengths: Object.fromEntries(index.docLengths),
+    avgDocLength: index.avgDocLength,
+    totalLength: index.totalLength,
+    docCount: index.docCount,
+  }
+}
+
+function deserializeBM25(data: SerializedBM25): BM25Index {
+  const invertedIndex = new Map<string, Map<string, number>>()
+  for (const [term, postings] of Object.entries(data.invertedIndex)) {
+    invertedIndex.set(term, new Map(Object.entries(postings).map(([k, v]) => [k, v as number])))
+  }
+  return {
+    invertedIndex,
+    docLengths: new Map(Object.entries(data.docLengths).map(([k, v]) => [k, v as number])),
+    avgDocLength: data.avgDocLength,
+    totalLength: data.totalLength,
+    docCount: data.docCount,
   }
 }

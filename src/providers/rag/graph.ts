@@ -156,10 +156,67 @@ export class EntityGraph {
     return this.edgeSet.size
   }
 
+  save(): SerializedGraph {
+    const nodes: SerializedEntityNode[] = []
+    for (const node of this.nodes.values()) {
+      nodes.push({ name: node.name, type: node.type, summary: node.summary, sessionIds: [...node.sessionIds] })
+    }
+    const edges: RelationshipEdge[] = []
+    const seen = new Set<string>()
+    for (const edgeList of this.adjacency.values()) {
+      for (const edge of edgeList) {
+        const key = `${edge.source}|${edge.relation}|${edge.target}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          edges.push(edge)
+        }
+      }
+    }
+    return { nodes, edges }
+  }
+
+  load(data: SerializedGraph): void {
+    this.clear()
+    for (const node of data.nodes) {
+      this.nodes.set(node.name, {
+        name: node.name,
+        type: node.type,
+        summary: node.summary,
+        sessionIds: new Set(node.sessionIds),
+      })
+      // Rebuild name index
+      const key = node.name.toLowerCase()
+      if (!this.nameIndex.has(key)) this.nameIndex.set(key, new Set())
+      this.nameIndex.get(key)!.add(node.name)
+      for (const part of node.name.split(/\s+/)) {
+        if (part.length > 2) {
+          const pk = part.toLowerCase()
+          if (!this.nameIndex.has(pk)) this.nameIndex.set(pk, new Set())
+          this.nameIndex.get(pk)!.add(node.name)
+        }
+      }
+    }
+    for (const edge of data.edges) {
+      this.addRelationship(edge)
+    }
+  }
+
   clear(): void {
     this.nodes.clear()
     this.edgeSet.clear()
     this.adjacency.clear()
     this.nameIndex.clear()
   }
+}
+
+interface SerializedEntityNode {
+  name: string
+  type: string
+  summary: string
+  sessionIds: string[]
+}
+
+export interface SerializedGraph {
+  nodes: SerializedEntityNode[]
+  edges: RelationshipEdge[]
 }

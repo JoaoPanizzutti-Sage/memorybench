@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs"
 import { embedMany, embed } from "ai"
 import { createOpenAI } from "@ai-sdk/openai"
 import type {
@@ -16,14 +17,16 @@ import { RAG_PROMPTS } from "./prompts"
 import { extractMemories, parseExtractionOutput } from "../../prompts/extraction"
 import { rerankResults } from "./reranker"
 import { EntityGraph } from "./graph"
+import type { SerializedGraph } from "./graph"
 
 const CHUNK_SIZE = 1600
 const CHUNK_OVERLAP = 320
 const EMBEDDING_BATCH_SIZE = 100
 const EMBEDDING_MODEL = "text-embedding-3-small"
-const RERANK_OVERFETCH = 30
+const RERANK_OVERFETCH = 40
 const EXTRACTION_CONCURRENCY = 10
 const MAX_GLOBAL_EXTRACTIONS = 300
+const CACHE_DIR = "./data/cache/rag"
 
 function chunkText(text: string, chunkSize: number = CHUNK_SIZE, overlap: number = CHUNK_OVERLAP): string[] {
   if (text.length <= chunkSize) {
@@ -103,6 +106,52 @@ export class RAGProvider implements Provider {
       this.graphs.set(containerTag, new EntityGraph())
     }
     return this.graphs.get(containerTag)!
+  }
+
+  private getCacheDir(containerTag: string): string {
+    return `${CACHE_DIR}/${containerTag}`
+  }
+
+  private saveToCache(containerTag: string): void {
+    const dir = this.getCacheDir(containerTag)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+
+    const searchData = this.searchEngine.save(containerTag)
+    if (searchData) {
+      writeFileSync(`${dir}/search.json`, JSON.stringify(searchData))
+      logger.info(`[cache] Saved search index for ${containerTag} (${searchData.chunks.length} chunks)`)
+    }
+
+    const graph = this.graphs.get(containerTag)
+    if (graph && graph.nodeCount > 0) {
+      const graphData = graph.save()
+      writeFileSync(`${dir}/graph.json`, JSON.stringify(graphData))
+      logger.info(`[cache] Saved entity graph for ${containerTag} (${graphData.nodes.length} nodes, ${graphData.edges.length} edges)`)
+    }
+  }
+
+  private loadFromCache(containerTag: string): boolean {
+    const dir = this.getCacheDir(containerTag)
+    const searchPath = `${dir}/search.json`
+    if (!existsSync(searchPath)) return false
+
+    try {
+      const searchData = JSON.parse(readFileSync(searchPath, "utf8"))
+      this.searchEngine.load(containerTag, searchData)
+
+      const graphPath = `${dir}/graph.json`
+      if (existsSync(graphPath)) {
+        const graphData = JSON.parse(readFileSync(graphPath, "utf8")) as SerializedGraph
+        const graph = this.getGraph(containerTag)
+        graph.load(graphData)
+      }
+
+      logger.info(`[cache] Loaded index for ${containerTag} (${this.searchEngine.getChunkCount(containerTag)} chunks)`)
+      return true
+    } catch (e) {
+      logger.warn(`[cache] Failed to load cache for ${containerTag}: ${e}`)
+      return false
+    }
   }
 
   async initialize(config: ProviderConfig): Promise<void> {
@@ -278,6 +327,7 @@ export class RAGProvider implements Provider {
     }
 
     this.searchEngine.addChunks(options.containerTag, embeddedChunks)
+    this.saveToCache(options.containerTag)
 
     const documentIds = embeddedChunks.map((c) => c.id)
     logger.debug(
@@ -301,6 +351,11 @@ export class RAGProvider implements Provider {
 
   async search(query: string, options: SearchOptions): Promise<unknown[]> {
     if (!this.openai) throw new Error("Provider not initialized")
+
+    // Load cached index if in-memory is empty
+    if (!this.searchEngine.hasData(options.containerTag)) {
+      this.loadFromCache(options.containerTag)
+    }
 
     const embeddingModel = this.openai.embedding(EMBEDDING_MODEL)
     let queryEmbedding: number[]

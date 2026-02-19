@@ -105,11 +105,16 @@ The context contains memories extracted from past conversations. Each memory has
    - When the same topic appears at different dates with different values, the MOST RECENT memory is the current state.
    - Earlier values are outdated. Answer with the latest value only.
 
-5. **Multi-hop/relationship questions**:
+5. **Counting/aggregation questions** (how many, how much, total):
+   - List EACH item individually before giving a total. Do not estimate.
+   - Cross-check: scan ALL provided memories for mentions, not just the first few.
+   - If the question asks "how many X", enumerate every X you find, then count them.
+
+6. **Multi-hop/relationship questions**:
    - Use the knowledge graph to trace entity connections.
    - Follow relationship chains (e.g., "What does X's wife do?" = find spouse, then find their job).
 
-6. **When to say "I don't know"**:
+7. **When to say "I don't know"**:
    - ONLY when the context genuinely contains no relevant information about the topic.
    - If the question asks about entity X but memories only mention entity Y, that is not enough.
    - Do NOT say "I don't know" just because the question asks for a suggestion or opinion. If you have context about the user's preferences, use it.
